@@ -1,60 +1,86 @@
-## Anomaly Detection Service (`s_2`)
 
-This service is a **Kafka Consumer**. It listens for triggers, pulls the latest market data from Redis, and runs an algorithm to detect significant price swings (anomalies) in stock tickers.
+# Anomaly Detection Consumer
 
----
-
-### 🧠 Logic & Flow
-The service acts as an intelligent observer. Instead of just passing data through, it compares current market prices against the previous state.
-
-
-
-1.  **Listen:** Waits for a message on the `anomaly` Kafka topic.
-2.  **Fetch:** When triggered, it pulls the full OHLCV batch from Redis (`latest_ohlcv`).
-3.  **Analyze:** It compares the current `close` price of each ticker (e.g., AAPL, MSFT) to the price stored in `ohlcv_baseline`.
-4.  **Detect:** If the price has changed by **more than 5%**, it flags it as an anomaly.
-5.  **Update:** It saves the new "Baseline" and the list of detected "Anomalies" back to Redis.
+Kafka consumer that triggers on new OHLCV data, compares close prices against a stored baseline, and flags tickers with >5% price swings. Results are written back to Redis for downstream access.
 
 ---
 
-### 📋 Technical Requirements
-* **Node.js 20+**: The runtime environment.
-* **Redis**: Used as the primary data source and result store.
-* **Kafka Cluster**: Provides the trigger signals for the analysis.
-* **SSL Certs**: Decoded from Base64 at startup for secure Kafka communication.
+## Architecture Role
 
----
-
-### 🔑 Configuration (`.env`)
-The service requires the same secure connection details as the producer to access the shared infrastructure:
-
-| Variable | Description |
-| :--- | :--- |
-| `KAFKA_URL` | Kafka broker endpoint. |
-| `REDIS_URL` | Redis connection URL. |
-| `SERVICE_CERT` | Client SSL Certificate (Base64). |
-| `SERVICE_KEY` | Client Private Key (Base64). |
-
----
-
-### 🌐 API Endpoints
-While the service runs automatically, you can inspect its findings via these HTTP endpoints:
-
-* **GET `/anomalies`**: Returns a list of all tickers currently showing a >5% price swing.
-* **GET `/baseline`**: Returns the previous market state used for comparison.
-
----
-
-### 🐳 Deployment
-Optimized for production using a lightweight Docker image.
-
-**Build:**
-```bash
-docker build -t anomaly-detector .
+```
+Kafka (topic: anomaly)
+        ↓ trigger ("redis")
+s_2 reads latest_ohlcv from Redis
+        ↓ compare against ohlcv_baseline
+        ↓ flag tickers where |Δclose| > 5%
+Redis ← writes: anomaly_ohlcv + ohlcv_baseline (TTL: 10 min)
 ```
 
-**Run:**
+---
+
+## Detection Logic
+
+| Step | Action |
+|------|--------|
+| 1. Receive | Kafka message on `anomaly` topic (pointer, not payload) |
+| 2. Fetch | Read `latest_ohlcv` from Redis |
+| 3. Compare | Diff `close` vs `ohlcv_baseline` per ticker |
+| 4. Flag | `\|Δclose / prev_close\| > 5%` → anomaly |
+| 5. Write | Update `anomaly_ohlcv` + `ohlcv_baseline` in Redis |
+
+Deduplication via `ticker_date` composite key — re-runs won't produce duplicate anomaly entries.
+
+---
+
+## Stack
+
+| Layer     | Technology                   |
+|-----------|------------------------------|
+| Runtime   | Node.js 20+ (ESM)            |
+| Messaging | Kafka consumer (group: `anomaly-service`) |
+| Cache     | Redis (read source + write target) |
+| HTTP      | Express (inspection endpoints) |
+
+---
+
+## Environment Variables
+
+| Variable       | Description                        |
+|----------------|------------------------------------|
+| `KAFKA_URL`    | Kafka broker address               |
+| `REDIS_URL`    | Redis connection string            |
+| `SERVICE_CERT` | SSL client cert (Base64-encoded)   |
+| `SERVICE_KEY`  | SSL private key (Base64-encoded)   |
+
+---
+
+## Endpoints
+
+| Method | Path         | Returns                                      |
+|--------|--------------|----------------------------------------------|
+| GET    | `/anomalies` | All tickers with >5% swing (current window)  |
+| GET    | `/baseline`  | Previous OHLCV state used for comparison     |
+
+---
+
+## Running
+
 ```bash
+# Local
+npm install
+node index.js
+
+# Docker
+docker build -t anomaly-detector .
 docker run -p 3001:3001 --env-file .env anomaly-detector
 ```
+
+---
+
+## Known Behavior
+
+- No baseline on first run → no anomalies detected, baseline is seeded for next cycle
+- `anomaly_ohlcv` is **overwritten** each run (not appended) — reflects current window only
+- TTL on both Redis keys: 600s — aligns with producer's cache window
+
 
